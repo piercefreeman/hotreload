@@ -82,8 +82,10 @@ When code changes are made in your project, we will:
 To test how firehot works with a real project, we bundle a `mypackage` and `external-package` library in this repo.
 
 ```bash
-make
-uv run test-hotreload
+# To do a regular, fast development build
+(make build-develop && cd mypackage && uv run test-hotreload)
+# To pass the args we use in a release
+(make build-develop MATURIN_ARGS="--release --strip" && cd mypackage && uv run test-hotreload)
 ```
 
 ## Unit tests

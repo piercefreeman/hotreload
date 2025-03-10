@@ -24,7 +24,15 @@ if TYPE_CHECKING:
 module_path: str
 pickled_str: str
 
-log_level = getenv("FIREHOT_LOG_LEVEL", "WARNING")
+known_log_levels = {
+    "TRACE": logging.DEBUG,
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+}
+dynamic_imports = sys.argv[1] if len(sys.argv) > 1 else ""
+log_level = known_log_levels.get(getenv("FIREHOT_LOG_LEVEL", "WARNING"), logging.WARNING)
 logging.basicConfig(level=log_level)
 
 # Decode base64 and unpickle

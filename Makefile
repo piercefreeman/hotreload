@@ -187,7 +187,7 @@ test-hotreload:
 build-develop:
 	@echo "=== Building development version for mypackage ==="
 	cd mypackage && \
-	(cd .. && uv run maturin build) && \
+	(cd .. && uv run maturin build $(MATURIN_ARGS)) && \
 	rm -f uv.lock && \
 	uv sync
 	@echo "=== Development build completed successfully ==="

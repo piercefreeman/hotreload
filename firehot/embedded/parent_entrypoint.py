@@ -44,8 +44,9 @@ class MessageBase:
 
 @dataclass
 class ForkRequest(MessageBase):
+    request_id: str
     code: str
-
+    request_name: str
     name: MessageType = MessageType.FORK_REQUEST
 
 
@@ -59,6 +60,9 @@ class ExitRequest(MessageBase):
 
 @dataclass
 class ForkResponse(MessageBase):
+    request_id: str
+    request_name: str
+
     child_pid: int
 
     name: MessageType = MessageType.FORK_RESPONSE
@@ -150,14 +154,54 @@ def read_message() -> MessageBase | None:
 
 
 #
+# Logging
+#
+
+
+class MultiplexedStream:
+    def __init__(self, original_stream, stream_name: str):
+        self.original_stream = original_stream
+        self.stream_name = stream_name
+        self.pid = os.getpid()
+
+    def write(self, text: str) -> int:
+        # Add PID prefix to each line (newlines and lines with values)
+        prefix = f"[PID:{self.pid}:{self.stream_name}]"
+
+        text = text.strip()
+        if not text:
+            return
+
+        prefixed_text = ""
+        lines = text.split("\n")
+        for line in lines:
+            prefixed_text += f"{prefix}{line}\n"
+        return self.original_stream.write(prefixed_text)
+
+    def flush(self) -> None:
+        return self.original_stream.flush()
+
+    # Forward all other attributes to the original stream
+    def __getattr__(self, attr):
+        return getattr(self.original_stream, attr)
+
+
+#
 # Main Logic
 #
 
 
 def main():
     # This will be populated with dynamic import statements from Rust
+    known_log_levels = {
+        "TRACE": logging.DEBUG,
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,
+        "WARNING": logging.WARNING,
+        "ERROR": logging.ERROR,
+    }
     dynamic_imports = sys.argv[1] if len(sys.argv) > 1 else ""
-    log_level = getenv("FIREHOT_LOG_LEVEL", "WARNING")
+    log_level = known_log_levels.get(getenv("FIREHOT_LOG_LEVEL", "WARNING"), logging.WARNING)
     logging.basicConfig(level=log_level)
 
     # Execute the dynamic imports
@@ -180,6 +224,18 @@ def main():
                 # Set up globals and locals for execution
                 exec_globals = globals().copy()
                 exec_locals = {}
+
+                # Immediately route stdout and stderr to a custom convention that specifies the
+                # current pid, so our rust watcher can separate them from the single stdout stream
+                # that's inherited from the parent environment
+
+                # Save original stdout and stderr
+                original_stdout = sys.stdout
+                original_stderr = sys.stderr
+
+                # Replace with PID-prefixed versions
+                sys.stdout = MultiplexedStream(original_stdout, "stdout")
+                sys.stderr = MultiplexedStream(original_stderr, "stderr")
 
                 logging.info("Will execute code in forked process...")
                 sys.stdout.flush()
@@ -214,7 +270,13 @@ def main():
 
             if isinstance(command, ForkRequest):
                 fork_pid = handle_fork_request(command.code)
-                write_message(ForkResponse(child_pid=fork_pid))
+                write_message(
+                    ForkResponse(
+                        request_id=command.request_id,
+                        request_name=command.request_name,
+                        child_pid=fork_pid,
+                    )
+                )
             elif isinstance(command, ExitRequest):
                 logging.info("Exiting loader process")
                 sys.stdout.flush()

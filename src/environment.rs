@@ -1,40 +1,34 @@
 use anstream::eprintln;
 use anyhow::{anyhow, Result};
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use owo_colors::OwoColorize;
 use serde_json::{self};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::{BufReader, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use libc;
 use std::io::BufRead;
-use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::ast::ProjectAstManager;
+use crate::async_resolve::AsyncResolve;
+use crate::layer::{ForkResult, Layer, ProcessResult};
 use crate::messages::{ExitRequest, ForkRequest, Message};
 use crate::scripts::{PYTHON_CHILD_SCRIPT, PYTHON_LOADER_SCRIPT};
 
-/// Runtime environment for executing Python code
-pub struct Environment {
-    pub child: Child,                    // The forkable process with all imports loaded
-    pub stdin: std::process::ChildStdin, // The stdin of the forkable process
-    pub reader: std::io::Lines<BufReader<std::process::ChildStdout>>, // The reader of the forkable process
-    pub forked_processes: HashMap<String, i32>,                       // Map of UUID to PID
-}
-
 /// Runner for isolated Python code execution
-pub struct ImportRunner {
+pub struct Environment {
     pub id: String,
-    pub environment: Option<Arc<Mutex<Environment>>>,
-    pub ast_manager: ProjectAstManager, // Project AST manager for this environment
+    pub layer: Option<Arc<Mutex<Layer>>>, // The current layer that is tied to this environment
+    pub ast_manager: ProjectAstManager,   // Project AST manager for this environment
 
     first_scan: bool,
 }
 
-impl ImportRunner {
+impl Environment {
     pub fn new(project_name: &str, project_path: &str) -> Self {
         // Create a new AST manager for this project
         let ast_manager = ProjectAstManager::new(project_name, project_path);
@@ -42,7 +36,7 @@ impl ImportRunner {
 
         Self {
             id: Uuid::new_v4().to_string(),
-            environment: None,
+            layer: None,
             ast_manager,
             first_scan: false,
         }
@@ -134,7 +128,7 @@ impl ImportRunner {
         eprintln!(
             "\n{} {} {} {}{} {}\n",
             "✓".green().bold(),
-            "Import environment booted in".white().bold(),
+            "Layer built in".white().bold(),
             elapsed_ms.to_string().yellow().bold(),
             "ms".white().bold(),
             if elapsed_ms > 1000 {
@@ -150,22 +144,20 @@ impl ImportRunner {
             format!("with ID: {}", self.id).white().bold()
         );
 
-        // Create and store the environment
-        let environment = Environment {
-            child,
-            stdin,
-            reader: lines_iter,
-            forked_processes: HashMap::new(),
-        };
+        // Create the environment
+        let mut layer = Layer::new(child, stdin, lines_iter);
 
-        self.environment = Some(Arc::new(Mutex::new(environment)));
+        // Start the monitor thread
+        layer.start_monitor_thread();
+
+        self.layer = Some(Arc::new(Mutex::new(layer)));
 
         Ok(())
     }
 
     pub fn stop_main(&self) -> Result<bool, String> {
         // Check if environment is initialized
-        let environment = match self.environment.as_ref() {
+        let layer = match self.layer.as_ref() {
             Some(env) => env,
             None => {
                 info!("No environment to stop.");
@@ -175,22 +167,50 @@ impl ImportRunner {
 
         info!("Stopping main runner process");
 
-        let mut env_guard = environment
+        let mut env_guard = layer
             .lock()
             .map_err(|e| format!("Failed to lock environment mutex: {}", e))?;
 
-        // Kill the main child process
+        // IMPORTANT: Kill the main child process FIRST
+        info!("Killing child process to unblock monitor thread");
         if let Err(e) = env_guard.child.kill() {
             warn!("Failed to kill child process: {}", e);
         }
 
         // Wait for the process to exit
+        info!("Waiting for child process to exit");
         if let Err(e) = env_guard.child.wait() {
             warn!("Failed to wait for child process: {}", e);
+        } else {
+            info!("Child process exited successfully");
         }
 
-        // Clear the process map
-        env_guard.forked_processes.clear();
+        // Now it's safe to stop the monitor thread, since the child process stdout
+        // has been closed and the reader.next() in the monitor thread should return None
+        info!("Now stopping monitor thread");
+        env_guard.stop_monitor_thread();
+
+        // Clear all the maps
+        let mut forked_processes = env_guard
+            .forked_processes
+            .lock()
+            .map_err(|e| format!("Failed to lock forked processes: {}", e))?;
+        forked_processes.clear();
+        drop(forked_processes);
+
+        let mut fork_resolvers = env_guard
+            .fork_resolvers
+            .lock()
+            .map_err(|e| format!("Failed to lock fork resolvers: {}", e))?;
+        fork_resolvers.clear();
+        drop(fork_resolvers);
+
+        let mut completion_resolvers = env_guard
+            .completion_resolvers
+            .lock()
+            .map_err(|e| format!("Failed to lock completion resolvers: {}", e))?;
+        completion_resolvers.clear();
+        drop(completion_resolvers);
 
         info!("Main runner process stopped");
         Ok(true)
@@ -222,15 +242,20 @@ impl ImportRunner {
         );
 
         // Stop any existing processes
-        if let Some(env) = self.environment.as_ref() {
+        if let Some(env) = self.layer.as_ref() {
             let forked_processes = {
                 let env_guard = env
                     .lock()
-                    .map_err(|e| format!("Failed to lock environment mutex: {}", e))?;
+                    .map_err(|e| format!("Failed to lock layer mutex: {}", e))?;
+
+                // Get the forked processes mutex
+                let forked_processes_guard = env_guard
+                    .forked_processes
+                    .lock()
+                    .map_err(|e| format!("Failed to lock forked processes: {}", e))?;
 
                 // Create a copy of the process UUIDs
-                env_guard
-                    .forked_processes
+                forked_processes_guard
                     .keys()
                     .cloned()
                     .collect::<Vec<String>>()
@@ -247,7 +272,7 @@ impl ImportRunner {
             self.stop_main()?;
         }
 
-        // Boot a new environment
+        // Boot a new layer
         self.boot_main()?;
 
         info!("Environment updated successfully");
@@ -258,19 +283,39 @@ impl ImportRunner {
     // Isolated process management
     //
 
-    /// Execute a function in the isolated environment. This should be called from the main thread (the one
+    /// This function executes code in a forked process (not in the main process
     /// that spawned our hotreloader) so we can get the local function and closure variables.
-    pub fn exec_isolated(&self, pickled_data: &str) -> Result<String, String> {
+    pub fn exec_isolated(&self, pickled_data: &str, name: &str) -> Result<String, String> {
         // Check if environment is initialized
         let environment = self
-            .environment
+            .layer
             .as_ref()
             .ok_or_else(|| "Environment not initialized. Call boot_main first.".to_string())?;
+
+        // Generate a process UUID
+        let process_uuid = Uuid::new_v4().to_string();
 
         // Send the code to the forked process
         let mut env_guard = environment
             .lock()
             .map_err(|e| format!("Failed to lock environment mutex: {}", e))?;
+
+        // Create async resolvers for both fork status and completion
+        let fork_resolver = AsyncResolve::new();
+        let mut fork_resolvers = env_guard
+            .fork_resolvers
+            .lock()
+            .map_err(|e| format!("Failed to lock fork resolvers: {}", e))?;
+        fork_resolvers.insert(process_uuid.clone(), fork_resolver.clone());
+        drop(fork_resolvers);
+
+        let completion_resolver = AsyncResolve::new();
+        let mut completion_resolvers = env_guard
+            .completion_resolvers
+            .lock()
+            .map_err(|e| format!("Failed to lock completion resolvers: {}", e))?;
+        completion_resolvers.insert(process_uuid.clone(), completion_resolver.clone());
+        drop(completion_resolvers);
 
         let exec_code = format!(
             r#"
@@ -281,7 +326,11 @@ pickled_str = "{}"
         );
 
         // Create a ForkRequest message
-        let fork_request = ForkRequest { code: exec_code };
+        let fork_request = ForkRequest {
+            request_id: process_uuid.clone(),
+            request_name: name.to_string(),
+            code: exec_code,
+        };
 
         let fork_json = serde_json::to_string(&Message::ForkRequest(fork_request))
             .map_err(|e| format!("Failed to serialize fork request: {}", e))?;
@@ -294,56 +343,32 @@ pickled_str = "{}"
             .flush()
             .map_err(|e| format!("Failed to flush child stdin: {}", e))?;
 
-        // Wait for response
-        let mut process_uuid = Uuid::new_v4().to_string();
-        let mut pid: Option<i32> = None;
+        // Release the lock so we don't block other operations
+        drop(env_guard);
 
-        for line in &mut env_guard.reader {
-            let line = line.map_err(|e| format!("Failed to read line: {}", e))?;
-
-            // Try to parse the response as a Message
-            if let Ok(message) = serde_json::from_str::<Message>(&line) {
-                match message {
-                    Message::ForkResponse(response) => {
-                        process_uuid = process_uuid.clone(); // Keep UUID same, but set PID
-                        pid = Some(response.child_pid);
-                        debug!("Fork complete. UUID: {}, PID: {:?}", process_uuid, pid);
-                        break;
-                    }
-                    Message::ChildError(error) => {
-                        error!("Fork error: {}", error.error);
-                        return Err(format!("Fork error: {}", error.error));
-                    }
-                    _ => {
-                        // Log other message types
-                        debug!("Unexpected message: {}", line);
-                    }
-                }
-            } else {
-                // Log any non-message output
-                debug!("Non-message output: {}", line);
+        // Wait for the fork to complete
+        debug!("Waiting for fork status for process {}...", process_uuid);
+        match fork_resolver.wait() {
+            Ok(ForkResult::Complete(_)) => {
+                debug!("Fork completed successfully for process {}", process_uuid);
+                Ok(process_uuid)
+            }
+            Ok(ForkResult::Error(error)) => {
+                error!("Fork error for process {}: {}", process_uuid, error);
+                Err(error)
+            }
+            Err(e) => {
+                warn!("Error waiting for fork status: {}", e);
+                Err("Fork operation failed with unknown error".to_string())
             }
         }
-
-        if process_uuid.is_empty() {
-            return Err("Failed to get process UUID from fork operation".to_string());
-        }
-
-        // Store the PID with its UUID
-        if let Some(pid_val) = pid {
-            env_guard
-                .forked_processes
-                .insert(process_uuid.clone(), pid_val);
-        }
-
-        Ok(process_uuid)
     }
 
     /// Stop an isolated process by UUID
     pub fn stop_isolated(&self, process_uuid: &str) -> Result<bool, String> {
         // Check if environment is initialized
         let environment = self
-            .environment
+            .layer
             .as_ref()
             .ok_or_else(|| "Environment not initialized. Call boot_main first.".to_string())?;
 
@@ -353,13 +378,19 @@ pickled_str = "{}"
             .map_err(|e| format!("Failed to lock environment mutex: {}", e))?;
 
         // Check if the process UUID exists
-        if !env_guard.forked_processes.contains_key(process_uuid) {
+        let forked_processes = env_guard
+            .forked_processes
+            .lock()
+            .map_err(|e| format!("Failed to lock forked processes: {}", e))?;
+
+        if !forked_processes.contains_key(process_uuid) {
             warn!("No forked process found with UUID: {}", process_uuid);
             return Ok(false); // Nothing to stop
         }
 
-        let pid = env_guard.forked_processes[process_uuid];
+        let pid = forked_processes[process_uuid];
         info!("Found process with PID: {}", pid);
+        drop(forked_processes);
 
         // Try to kill the process by PID
         unsafe {
@@ -394,67 +425,95 @@ pickled_str = "{}"
             warn!("Failed to flush child stdin: {}", e);
         }
 
-        // Remove the process from our map
-        env_guard.forked_processes.remove(process_uuid);
-        info!(
-            "Removed process UUID: {} from forked_processes map",
-            process_uuid
-        );
+        // Remove the process from our maps
+        let mut forked_processes = env_guard
+            .forked_processes
+            .lock()
+            .map_err(|e| format!("Failed to lock forked processes: {}", e))?;
+        forked_processes.remove(process_uuid);
+        drop(forked_processes);
+
+        let mut fork_resolvers = env_guard
+            .fork_resolvers
+            .lock()
+            .map_err(|e| format!("Failed to lock fork resolvers: {}", e))?;
+        fork_resolvers.remove(process_uuid);
+        drop(fork_resolvers);
+
+        let mut completion_resolvers = env_guard
+            .completion_resolvers
+            .lock()
+            .map_err(|e| format!("Failed to lock completion resolvers: {}", e))?;
+        completion_resolvers.remove(process_uuid);
+        drop(completion_resolvers);
+
+        info!("Removed process UUID: {} from process maps", process_uuid);
 
         Ok(true)
     }
 
-    /// Communicate with an isolated process to get its output
+    /// Retrieve the result of an isolated execution
     pub fn communicate_isolated(&self, process_uuid: &str) -> Result<Option<String>, String> {
         // Check if environment is initialized
         let environment = self
-            .environment
+            .layer
             .as_ref()
-            .ok_or_else(|| "No environment available for communication".to_string())?;
+            .ok_or_else(|| "Environment not initialized. Call boot_main first.".to_string())?;
 
-        let mut env_guard = environment
+        let env_guard = environment
             .lock()
             .map_err(|e| format!("Failed to lock environment mutex: {}", e))?;
 
         // Check if the process exists
-        if !env_guard.forked_processes.contains_key(process_uuid) {
-            return Err(format!("Process {} does not exist", process_uuid));
+        let forked_processes = env_guard
+            .forked_processes
+            .lock()
+            .map_err(|e| format!("Failed to lock forked processes: {}", e))?;
+
+        if !forked_processes.contains_key(process_uuid) {
+            return Err(format!(
+                "No forked process found with UUID: {}",
+                process_uuid
+            ));
         }
+        drop(forked_processes);
 
-        // Read from the process output
-        for line in &mut env_guard.reader {
-            let line = line.map_err(|e| format!("Failed to read line: {}", e))?;
+        // Get the completion resolver
+        let completion_resolvers = env_guard
+            .completion_resolvers
+            .lock()
+            .map_err(|e| format!("Failed to lock completion resolvers: {}", e))?;
 
-            // Try to parse as a Message
-            match serde_json::from_str::<Message>(&line) {
-                Ok(message) => match message {
-                    Message::ChildComplete(complete) => {
-                        trace!("Received function result: {:?}", complete);
-                        return Ok(complete.result);
-                    }
-                    Message::ChildError(error) => {
-                        error!("Received function error: {:?}", error);
-                        // Format the error with traceback information if available
-                        let error_message = match error.traceback {
-                            Some(traceback) => format!("{}\n\n{}", error.error, traceback),
-                            None => error.error,
-                        };
-                        return Err(error_message);
-                    }
-                    _ => {
-                        trace!("Received other message type: {:?}", message);
-                    }
-                },
-                Err(_) => {
-                    // If parsing fails, print the raw line with an "[isolate]" prefix.
-                    println!("[isolate] {}", line);
-                    continue;
-                }
+        let completion_resolver = match completion_resolvers.get(process_uuid) {
+            Some(resolver) => resolver.clone(),
+            None => {
+                return Err(format!(
+                    "No completion resolver found for UUID: {}",
+                    process_uuid
+                ))
+            }
+        };
+        drop(completion_resolvers);
+
+        // Release the environment guard so we don't block other operations
+        drop(env_guard);
+
+        // Wait for the completion
+        debug!("Waiting for process completion: {}", process_uuid);
+        match completion_resolver.wait() {
+            Ok(ProcessResult::Complete(result)) => {
+                debug!("Process completed successfully: {}", process_uuid);
+                Ok(result)
+            }
+            Ok(ProcessResult::Error(error)) => {
+                error!("Process error for UUID {}: {}", process_uuid, error);
+                Err(error)
+            }
+            Err(e) => {
+                warn!("Error waiting for process completion: {}", e);
+                Err("Process completion failed with unknown error".to_string())
             }
         }
-
-        // If we get here, there was no output to read
-        Ok(None)
     }
 }
 
@@ -487,7 +546,6 @@ fn spawn_python_loader(modules: &HashSet<String>) -> Result<Child> {
 mod tests {
     use super::*;
 
-    use crate::messages::ChildComplete;
     use tempfile::TempDir;
 
     use std::fs::File;
@@ -510,22 +568,17 @@ mod tests {
         // Create a simple Python project
         create_temp_py_file(&temp_dir, "main.py", "print('Hello, world!')");
 
-        let mut runner = ImportRunner::new("test_package", dir_path);
+        let mut runner = Environment::new("test_package", dir_path);
         assert_eq!(runner.ast_manager.get_project_path(), dir_path);
 
         // Boot the environment before checking it
         runner.boot_main().expect("Failed to boot main environment");
 
         // Check that the environment exists and has an empty forked_processes map
-        assert!(runner.environment.is_some());
-        assert!(runner
-            .environment
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .forked_processes
-            .is_empty());
+        assert!(runner.layer.is_some());
+        let env_guard = runner.layer.as_ref().unwrap().lock().unwrap();
+        let forked_processes = env_guard.forked_processes.lock().unwrap();
+        assert!(forked_processes.is_empty());
     }
 
     #[test]
@@ -536,7 +589,7 @@ mod tests {
         // Create a simple Python project with initial imports
         create_temp_py_file(&temp_dir, "main.py", "import os\nimport sys");
 
-        let mut runner = ImportRunner::new("test_package", dir_path);
+        let mut runner = Environment::new("test_package", dir_path);
 
         // Boot the environment before accessing it
         runner.boot_main().expect("Failed to boot main environment");
@@ -545,14 +598,7 @@ mod tests {
         runner.first_scan = true;
 
         // Get the PID of the initial Python process
-        let initial_pid = runner
-            .environment
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .child
-            .id();
+        let initial_pid = runner.layer.as_ref().unwrap().lock().unwrap().child.id();
         println!("Initial process PID: {:?}", initial_pid);
 
         // First, prime the system by calling process_all_py_files to establish a baseline
@@ -574,14 +620,7 @@ mod tests {
         );
 
         // Get the PID after update with no changes
-        let unchanged_pid = runner
-            .environment
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .child
-            .id();
+        let unchanged_pid = runner.layer.as_ref().unwrap().lock().unwrap().child.id();
         println!("PID after no changes: {:?}", unchanged_pid);
 
         // Verify that the process was NOT restarted (PIDs should be the same)
@@ -612,22 +651,8 @@ mod tests {
         );
 
         // Get the PID of the new Python process
-        let new_pid = runner
-            .environment
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .child
-            .id();
+        let new_pid = runner.layer.as_ref().unwrap().lock().unwrap().child.id();
         println!("New process PID after import changes: {:?}", new_pid);
-
-        // For completeness, but we don't expect this to pass since we didn't actually restart
-        // the process in our test mock
-        // assert_ne!(
-        //     initial_pid, new_pid,
-        //     "Process should have been restarted with a different PID when imports changed"
-        // );
     }
 
     #[test]
@@ -635,89 +660,63 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_str().unwrap();
 
-        let mut runner = ImportRunner::new("test_package", dir_path);
+        // Create a simple Python script that returns a timestamp
+        let python_script = r#"
+import time
+
+def main():
+    # Return the current timestamp as a string
+    return str(time.time())
+        "#;
+
+        // Prepare the script for isolation
+        let (pickled_data, python_env) =
+            crate::harness::prepare_script_for_isolation(python_script, "main")
+                .expect("Failed to prepare script for isolation");
+
+        let mut runner = Environment::new("test_package", &python_env.container_path);
 
         // Boot the environment before accessing it
         runner.boot_main().expect("Failed to boot main environment");
 
-        // Set up a mock test process
-        {
-            let env = runner.environment.as_ref().unwrap();
-            let mut env_guard = env.lock().unwrap();
+        // Execute the script in isolation
+        let process_uuid = runner
+            .exec_isolated(&pickled_data, "timestamp_test")
+            .expect("Failed to execute script in isolation");
 
-            // Create a test UUID and add it to the forked processes map
-            let test_uuid = Uuid::new_v4().to_string();
-            let test_pid = 12345;
-            env_guard
-                .forked_processes
-                .insert(test_uuid.clone(), test_pid);
+        // Wait a short time for the process to execute
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
-            // Create a temporary file with our mock output
-            let temp_file = tempfile::NamedTempFile::new().unwrap();
-            let temp_file_path = temp_file.path().to_str().unwrap().to_string();
+        // Now call communicate_isolated to get the result
+        let communicate_result = runner.communicate_isolated(&process_uuid);
+        assert!(
+            communicate_result.is_ok(),
+            "communicate_isolated failed: {:?}",
+            communicate_result.err()
+        );
 
-            // Write the mock response to the file
-            let timestamp = format!(
-                "{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs_f64()
-            );
-            let message = Message::ChildComplete(ChildComplete {
-                result: Some(timestamp.clone()),
-            });
-            let message_json = serde_json::to_string(&message).unwrap();
-            std::fs::write(&temp_file_path, format!("{}\n", message_json)).unwrap();
+        let result_option = communicate_result.unwrap();
+        assert!(
+            result_option.is_some(),
+            "No result received from isolated process"
+        );
 
-            // Create a Command that cats the temp file instead of a real Python process
-            let mut cat_cmd = std::process::Command::new("cat")
-                .arg(&temp_file_path)
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
+        // The result should be our timestamp string
+        let result_str = result_option.unwrap();
+        println!("Result from time.time(): {}", result_str);
 
-            // Swap the reader with our new one
-            let stdout = cat_cmd.stdout.take().unwrap();
+        // Try to parse the result as a float to verify it's a valid timestamp
+        let parsed_result = result_str.parse::<f64>();
+        assert!(
+            parsed_result.is_ok(),
+            "Failed to parse result as a float: {}",
+            result_str
+        );
 
-            let new_reader = BufReader::new(stdout).lines();
-
-            // Temporarily replace the environment's child process and reader
-            let _original_child = std::mem::replace(&mut env_guard.child, cat_cmd);
-            let _original_reader = std::mem::replace(&mut env_guard.reader, new_reader);
-
-            // Release the lock so we can use communicate_isolated
-            drop(env_guard);
-
-            // Now call communicate_isolated to process our mocked output
-            let communicate_result = runner.communicate_isolated(&test_uuid);
-            assert!(
-                communicate_result.is_ok(),
-                "communicate_isolated failed: {:?}",
-                communicate_result.err()
-            );
-
-            let result_option = communicate_result.unwrap();
-            assert!(
-                result_option.is_some(),
-                "No result received from isolated process"
-            );
-
-            // The result should be our timestamp string
-            let result_str = result_option.unwrap();
-            println!("Result from time.time(): {}", result_str);
-
-            // Try to parse the result as a float to verify it's a valid timestamp
-            let parsed_result = result_str.parse::<f64>();
-            assert!(
-                parsed_result.is_ok(),
-                "Failed to parse result as a float: {}",
-                result_str
-            );
-
-            // Clean up
-            std::fs::remove_file(temp_file_path).ok();
-        }
+        // Clean up by stopping the isolated process
+        runner
+            .stop_isolated(&process_uuid)
+            .expect("Failed to stop isolated process");
     }
 
     #[test]
@@ -725,44 +724,51 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_str().unwrap();
 
-        let mut runner = ImportRunner::new("test_package", dir_path);
+        let mut runner = Environment::new("test_package", dir_path);
 
         // Boot the environment before accessing it
         runner.boot_main().expect("Failed to boot main environment");
 
         // Create a test process UUID
-        let env = runner.environment.as_ref().unwrap();
-        let mut env_guard = env.lock().unwrap();
+        let env = runner.layer.as_ref().unwrap();
+        let env_guard = env.lock().unwrap();
 
         // Use a fixed UUID for testing
         let test_uuid = Uuid::new_v4().to_string();
         let test_pid = 23456;
 
         // Add mock process to the forked_processes map
-        env_guard
-            .forked_processes
-            .insert(test_uuid.clone(), test_pid);
+        let mut forked_processes = env_guard.forked_processes.lock().unwrap();
+        forked_processes.insert(test_uuid.clone(), test_pid);
+        drop(forked_processes);
+
+        // Create the required resolvers
+        let fork_resolver = AsyncResolve::new();
+        let mut fork_resolvers = env_guard.fork_resolvers.lock().unwrap();
+        fork_resolvers.insert(test_uuid.clone(), fork_resolver.clone());
+        drop(fork_resolvers);
+
+        let completion_resolver = AsyncResolve::new();
+        let mut completion_resolvers = env_guard.completion_resolvers.lock().unwrap();
+        completion_resolvers.insert(test_uuid.clone(), completion_resolver.clone());
+        drop(completion_resolvers);
 
         // Drop the guard so we can call stop_isolated
         drop(env_guard);
 
         // Verify the process is in the forked_processes map
         {
-            let processes = runner
-                .environment
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .forked_processes
-                .clone();
+            let env_guard = runner.layer.as_ref().unwrap().lock().unwrap();
+
+            let forked_processes = env_guard.forked_processes.lock().unwrap();
             assert!(
-                processes.contains_key(&test_uuid),
+                forked_processes.contains_key(&test_uuid),
                 "Process UUID should be in the forked_processes map"
             );
 
-            let pid = processes.get(&test_uuid).unwrap();
+            let pid = *forked_processes.get(&test_uuid).unwrap();
             println!("Process PID: {}", pid);
+            drop(forked_processes);
         }
 
         // Now stop the process
@@ -779,18 +785,14 @@ mod tests {
 
         // Verify the process is no longer in the forked_processes map
         {
-            let processes = runner
-                .environment
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .forked_processes
-                .clone();
+            let env_guard = runner.layer.as_ref().unwrap().lock().unwrap();
+
+            let forked_processes = env_guard.forked_processes.lock().unwrap();
             assert!(
-                !processes.contains_key(&test_uuid),
+                !forked_processes.contains_key(&test_uuid),
                 "Process UUID should be removed from the forked_processes map after termination"
             );
+            drop(forked_processes);
         }
 
         // Try to communicate with the terminated process
@@ -807,7 +809,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_str().unwrap();
 
-        let mut runner = ImportRunner::new("test_package", dir_path);
+        let mut runner = Environment::new("test_package", dir_path);
 
         // Boot the environment before stopping it
         runner.boot_main().expect("Failed to boot main environment");
@@ -842,12 +844,12 @@ def main():
         let (pickled_data, _python_env) =
             crate::harness::prepare_script_for_isolation(python_script, "main")?;
 
-        // Create and boot the ImportRunner
-        let mut runner = ImportRunner::new("test_package", dir_path);
+        // Create and boot the Environment
+        let mut runner = Environment::new("test_package", dir_path);
         runner.boot_main()?;
 
         // Execute the script in isolation - this should not fail at this point
-        let process_uuid = runner.exec_isolated(&pickled_data)?;
+        let process_uuid = runner.exec_isolated(&pickled_data, "test_script")?;
 
         // Wait a moment for the process to execute and fail
         std::thread::sleep(std::time::Duration::from_millis(100));

@@ -204,7 +204,7 @@ print(pickled_data)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::environment::ImportRunner;
+    use crate::environment::Environment;
     use base64;
     use base64::Engine;
 
@@ -252,14 +252,14 @@ def main():
         // Keep the temp_dir in scope until the end of the test
         let (pickled_data, python_env) = prepare_script_for_isolation(python_script, "main")?;
 
-        // Create a mock ImportRunner
-        let mut runner = ImportRunner::new("test_package", &python_env.container_path);
+        // Create a mock Environment
+        let mut runner = Environment::new("test_package", &python_env.container_path);
 
         // Boot the environment
         runner.boot_main()?;
 
         // Execute the script in isolation
-        let process_uuid = runner.exec_isolated(&pickled_data)?;
+        let process_uuid = runner.exec_isolated(&pickled_data, "test_script")?;
 
         // Verify the result - should be a valid UUID string
         assert!(!process_uuid.is_empty());

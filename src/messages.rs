@@ -23,6 +23,9 @@ pub trait MessageBase {
 /// Request to fork a process and execute code
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForkRequest {
+    pub request_id: String,
+    pub request_name: String,
+
     pub code: String,
 }
 
@@ -33,8 +36,12 @@ impl MessageBase for ForkRequest {
 }
 
 impl ForkRequest {
-    pub fn new(code: String) -> Self {
-        Self { code }
+    pub fn new(request_id: String, code: String, request_name: String) -> Self {
+        Self {
+            request_id,
+            code,
+            request_name,
+        }
     }
 }
 
@@ -63,6 +70,9 @@ impl ExitRequest {
 /// Response to a fork request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForkResponse {
+    pub request_id: String,
+    pub request_name: String,
+
     pub child_pid: i32,
 }
 
@@ -73,8 +83,12 @@ impl MessageBase for ForkResponse {
 }
 
 impl ForkResponse {
-    pub fn new(child_pid: i32) -> Self {
-        Self { child_pid }
+    pub fn new(request_id: String, request_name: String, child_pid: i32) -> Self {
+        Self {
+            request_id,
+            request_name,
+            child_pid,
+        }
     }
 }
 
@@ -322,7 +336,7 @@ mod tests {
         );
 
         // Test ForkRequest
-        let json = r#"{"name": "FORK_REQUEST", "code": "print('hello')"}"#;
+        let json = r#"{"name": "FORK_REQUEST", "code": "print('hello')", "request_id": "test-id", "request_name": "test-name"}"#;
         let parsed: Result<Message, _> = serde_json::from_str(json);
         assert!(
             parsed.is_ok(),
@@ -331,7 +345,7 @@ mod tests {
         );
 
         // Test ForkResponse
-        let json = r#"{"name": "FORK_RESPONSE", "child_pid": 1234}"#;
+        let json = r#"{"name": "FORK_RESPONSE", "child_pid": 1234, "request_id": "test-id", "request_name": "test-name"}"#;
         let parsed: Result<Message, _> = serde_json::from_str(json);
         assert!(
             parsed.is_ok(),
